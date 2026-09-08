@@ -169,6 +169,32 @@ test(
     }
 );
 
+test("evaluateStaticSkillIssues rejects malformed skill frontmatter", async () => {
+    const issues = await import("./evaluate.js").then(({ evaluateStaticSkillIssues }) => evaluateStaticSkillIssues("name: logs\n---\n\nDo stuff"));
+
+    assert.ok(issues.length > 0);
+    assert.ok(issues.some((issue) => issue.severity === "block"));
+    assert.match(issues[0]!.message, /frontmatter|header|malformed/i);
+});
+
+test("evaluateSkillDefinition rejects missing required header fields", async () => {
+    const evaluation = await evaluateSkillDefinition("---\nname: logs\n---\n\nThis is a skill that rotates logs.");
+
+    assert.equal(evaluation.score, 0);
+    assert.match(evaluation.reasoning, /description|required/i);
+});
+
+test("evaluateSkillDefinition flags mismatch between skill name and folder", async () => {
+    const evaluation = await evaluateSkillDefinition(
+        "---\nname: wrong-name\ndescription: Rotates and archives old log files.\n---\n\nArchive log files when they exceed a threshold.",
+        [],
+        { folderName: "rotate-log-files" }
+    );
+
+    assert.equal(evaluation.score, 0);
+    assert.match(evaluation.reasoning, /folder|name/i);
+});
+
 test("evaluateAgentDefinition rejects malformed frontmatter", async () => {
     const malformed = `name: thing\n---\n\nDo stuff with the code.`;
 

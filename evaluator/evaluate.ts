@@ -160,6 +160,79 @@ function evaluateStaticAgentIssues(agentDefinition: string): StaticIssue[] {
     return issues;
 }
 
+function parseMarkdownLinks(markdown: string): string[] {
+    const refs: string[] = [];
+    const linkRegex = /\[[^\]]+\]\(([^)]+)\)/g;
+    let match: RegExpExecArray | null;
+
+    while ((match = linkRegex.exec(markdown)) !== null) {
+        const ref = match[1]?.trim();
+        if (ref) {
+            refs.push(ref);
+        }
+    }
+
+    return refs;
+}
+
+function evaluateStaticSkillIssues(
+    skillDefinition: string,
+    skillArtifacts?: { path: string; content: string }[],
+    options?: { folderName?: string }
+): StaticIssue[] {
+    const issues: StaticIssue[] = [];
+    const parsed = parseFrontmatter(skillDefinition);
+
+    if (!parsed) {
+        return [{ severity: "block", message: "Malformed skill definition: missing a correctly formatted YAML frontmatter header." }];
+    }
+
+    const { fields, body } = parsed;
+    const requiredKeys = ["name", "description"];
+    for (const key of requiredKeys) {
+        const value = fields[key]?.trim();
+        if (!value || value.length < 3) {
+            issues.push({ severity: "block", message: `Missing or empty required skill field: ${key}.` });
+        }
+    }
+
+    const skillName = fields.name?.trim() ?? "";
+    const description = fields.description?.trim() ?? "";
+    const normalizedFolderName = options?.folderName?.trim();
+    if (normalizedFolderName && skillName && skillName !== normalizedFolderName) {
+        issues.push({ severity: "block", message: `Skill name '${skillName}' does not match the folder name '${normalizedFolderName}'.` });
+    }
+
+    const contentText = `${fields.name ?? ""} ${fields.description ?? ""} ${body}`.toLowerCase();
+    if (/(this might help|do something|whatever works|stuff|guess)/i.test(contentText)) {
+        issues.push({ severity: "warning", message: "Skill description or body is too vague and does not clearly describe the actual task and boundaries." });
+    }
+
+    const bodyIsSpecific = /##|steps|procedure|when to use|purpose|checklist|must|should|do not|avoid/i.test(body);
+    if (description && description.length < 30 && !bodyIsSpecific) {
+        issues.push({ severity: "warning", message: "Description is too generic to match the underlying skill instructions." });
+    }
+
+    const referencedArtifacts = new Map((skillArtifacts ?? []).map((artifact) => [artifact.path.replace(/\\/g, "/").replace(/^\.\//, ""), artifact]));
+    const referencedLinks = parseMarkdownLinks(body)
+        .map((ref) => ref.replace(/^\.\//, "").replace(/^\//, ""))
+        .filter((ref) => !ref.startsWith("http") && !ref.startsWith("#") && !ref.startsWith("mailto:"));
+
+    if (referencedLinks.length > 0) {
+        const missingLinks = referencedLinks.filter((ref) => !referencedArtifacts.has(ref));
+        if (missingLinks.length > 0) {
+            issues.push({ severity: "warning", message: `Referenced files are not present in the skill support files: ${missingLinks.join(", ")}.` });
+        }
+    }
+
+    const projectSpecificRe = /(C:\\|\/Users\/|\/home\/|github\.com|customer|client|tenant|tv 2|acme|contoso|project[- ]specific|repository name|repo name)/i;
+    if (projectSpecificRe.test(contentText)) {
+        issues.push({ severity: "warning", message: "Skill content appears to include project-specific or environment-specific details that reduce portability." });
+    }
+
+    return issues;
+}
+
 const baseRole = `
 You are an evaluator for agents, prompts, skills and tools. You will be given a code snippet and you need to evaluate its quality based on the following criteria:
 1. Correctness: Does the code do what it is supposed to do?
@@ -278,7 +351,20 @@ ${expectations}
     return await evaluateBase(systemMessage, evaluationPrompt);
 }
 
-async function evaluateSkillDefinition(skillDefinition: string, skillArtifacts?: { path: string; content: string }[]) : Promise<EvaluationResult> {
+async function evaluateSkillDefinition(
+    skillDefinition: string,
+    skillArtifacts?: { path: string; content: string }[],
+    options?: { folderName?: string }
+) : Promise<EvaluationResult> {
+    const staticIssues = evaluateStaticSkillIssues(skillDefinition, skillArtifacts, options);
+    const blockIssue = staticIssues.find((issue) => issue.severity === "block");
+    if (blockIssue) {
+        return {
+            score: 0,
+            reasoning: `Static validation failed: ${blockIssue.message}. ${staticIssues.filter((issue) => issue !== blockIssue).map((issue) => issue.message).join(" ")}`.trim(),
+        };
+    }
+
     const systemMessage = `
 ${baseRole}
 ${scoringSystem}
@@ -298,7 +384,17 @@ ${skillArtifacts.map(artifact => `<artifact path="${artifact.path}">${artifact.c
 `;
     }
 
-    return await evaluateBase(systemMessage, evaluationPrompt);
+    const evaluation = await evaluateBase(systemMessage, evaluationPrompt);
+    const warnings = staticIssues.filter((issue) => issue.severity === "warning");
+    const penalty = Math.min(4, warnings.length * 2);
+    const score = Math.max(0, Math.min(10, evaluation.score - penalty));
+
+    return {
+        score,
+        reasoning: warnings.length > 0
+            ? `${warnings.map((issue) => issue.message).join(" ")} ${evaluation.reasoning}`
+            : evaluation.reasoning,
+    };
 }
 
 async function evaluateAgentDefinition(agentDefinition: string): Promise<EvaluationResult> {
@@ -341,7 +437,8 @@ export {
     evaluatePerformance,
     evaluateSkillDefinition,
     evaluateAgentDefinition,
-    evaluateStaticAgentIssues
+    evaluateStaticAgentIssues,
+    evaluateStaticSkillIssues
 };
 
 export type { EvaluationResult };
