@@ -168,3 +168,28 @@ test(
         );
     }
 );
+
+test("evaluateAgentDefinition rejects malformed frontmatter", async () => {
+    const malformed = `name: thing\n---\n\nDo stuff with the code.`;
+
+    const evaluation = await evaluateAgentDefinition(malformed);
+
+    assert.equal(evaluation.score, 0);
+    assert.match(evaluation.reasoning, /frontmatter|yaml|structure/i);
+});
+
+test("evaluateAgentDefinition penalizes overly broad tool allow-lists", async () => {
+    const broadTools = `---
+name: broad-agent
+description: Does everything.
+tools: ["read", "search", "edit", "write", "bash", "execute", "web", "agent", "todo", "vscode"]
+model: Auto (copilot)
+---
+
+You can do anything anywhere.`;
+
+    const evaluation = await evaluateAgentDefinition(broadTools);
+
+    assert.ok(evaluation.score < 7, `expected a low score for an overbroad allow-list, got ${evaluation.score}`);
+    assert.match(evaluation.reasoning, /tool|allow-list|scope/i);
+});

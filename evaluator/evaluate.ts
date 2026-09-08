@@ -32,6 +32,134 @@ const evaluateTool = defineTool(
     }
 );
 
+type StaticIssue = {
+    severity: "block" | "warning";
+    message: string;
+};
+
+function parseFrontmatter(agentDefinition: string): { fields: Record<string, string>; body: string } | null {
+    const match = agentDefinition.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
+    if (!match) {
+        return null;
+    }
+
+    const fields: Record<string, string> = {};
+    const frontmatter = match[1];
+    if (!frontmatter) {
+        return null;
+    }
+
+    const lines = frontmatter.split(/\r?\n/);
+
+    for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith("#")) {
+            continue;
+        }
+
+        const keyValue = line.match(/^([A-Za-z0-9_-]+)\s*:\s*(.*)$/);
+        if (!keyValue) {
+            return null;
+        }
+
+        const [, key, value] = keyValue;
+        if (!key || value === undefined) {
+            return null;
+        }
+
+        fields[key] = value.trim();
+    }
+
+    return { fields, body: match[2] ?? "" };
+}
+
+function parseToolList(rawValue: string | undefined): string[] {
+    if (!rawValue) {
+        return [];
+    }
+
+    const trimmed = rawValue.trim();
+    if (!trimmed) {
+        return [];
+    }
+
+    const listMatch = trimmed.match(/^\[(.*)\]$/) || trimmed.match(/^\((.*)\)$/);
+    if (!listMatch || !listMatch[1]) {
+        return [];
+    }
+
+    return listMatch[1]
+        .split(",")
+        .map((tool) => tool.trim().replace(/^['\"]|['\"]$/g, ""))
+        .filter(Boolean);
+}
+
+function evaluateStaticAgentIssues(agentDefinition: string): StaticIssue[] {
+    const issues: StaticIssue[] = [];
+    const parsed = parseFrontmatter(agentDefinition);
+
+    if (!parsed) {
+        return [{ severity: "block", message: "Malformed agent definition: missing properly formatted YAML frontmatter." }];
+    }
+
+    const { fields } = parsed;
+    const requiredKeys = ["name", "description"];
+    for (const key of requiredKeys) {
+        const value = fields[key]?.trim();
+        if (!value || value.length < 3) {
+            issues.push({ severity: "block", message: `Missing or empty required frontmatter field: ${key}.` });
+        }
+    }
+
+    const name = fields.name?.trim();
+    if (name && !/^[A-Za-z0-9][A-Za-z0-9-]*$/.test(name)) {
+        issues.push({ severity: "warning", message: `Agent name should be a simple identifier; got '${name}'.` });
+    }
+
+    const description = fields.description?.trim() ?? "";
+    if (description && description.length < 20) {
+        issues.push({ severity: "warning", message: "Description is too brief to clearly communicate the agent's role and boundaries." });
+    }
+
+    const tools = parseToolList(fields.tools).map((tool) => tool.trim().toLowerCase());
+    if (tools.length === 0) {
+        issues.push({ severity: "block", message: "Tool allow-list is missing; read-only or write-capable functions are not declared." });
+    }
+
+    const riskyTools = new Set(["bash", "execute", "write", "edit", "web", "agent", "vscode", "todo"]);
+    const broadToolCount = tools.filter((tool) => riskyTools.has(tool)).length;
+    if (tools.length > 6 || broadToolCount > 3) {
+        issues.push({ severity: "warning", message: "Tool allow-list appears overly broad for a focused agent role." });
+    }
+
+    if (tools.length < 2 && description.toLowerCase().includes("implement")) {
+        issues.push({ severity: "warning", message: "The agent may need more explicit capabilities than a single tool for implementation work." });
+    }
+
+    const model = fields.model?.trim();
+    if (model) {
+        const normalizedModel = model.toLowerCase();
+        const validPrefix = ["auto", "claude", "gpt", "gemini", "kimi", "mai-code", "sonnet", "opus", "luna", "o3", "o4"];
+        if (!validPrefix.some((prefix) => normalizedModel.includes(prefix))) {
+            issues.push({ severity: "warning", message: `Model choice '${model}' does not match the expected Copilot model families.` });
+        }
+
+        const descriptionLower = description.toLowerCase();
+        const modeIsReview = /review|analyze|summarize|plan/.test(descriptionLower);
+        const modeIsImplement = /implement|code|write|edit|fix/.test(descriptionLower);
+
+        if (modeIsReview && !/claude|gpt|mai-code|kimi|auto/.test(normalizedModel)) {
+            issues.push({ severity: "warning", message: `Model '${model}' may be a weak choice for a review/planning role.` });
+        }
+
+        if (modeIsImplement && !/claude|gpt|mai-code|kimi|luna|sonnet|opus/.test(normalizedModel)) {
+            issues.push({ severity: "warning", message: `Model '${model}' may be a weak choice for an implementation-heavy role.` });
+        }
+    }
+
+    return issues;
+}
+
 const baseRole = `
 You are an evaluator for agents, prompts, skills and tools. You will be given a code snippet and you need to evaluate its quality based on the following criteria:
 1. Correctness: Does the code do what it is supposed to do?
@@ -174,6 +302,14 @@ ${skillArtifacts.map(artifact => `<artifact path="${artifact.path}">${artifact.c
 }
 
 async function evaluateAgentDefinition(agentDefinition: string): Promise<EvaluationResult> {
+    const staticIssues = evaluateStaticAgentIssues(agentDefinition);
+    const blockIssue = staticIssues.find((issue) => issue.severity === "block");
+    if (blockIssue) {
+        return {
+            score: 0,
+            reasoning: `Static validation failed: ${blockIssue.message}. ${staticIssues.filter((issue) => issue !== blockIssue).map((issue) => issue.message).join(" ")}`.trim(),
+        };
+    }
 
     const systemMessage = `
 ${baseRole}
@@ -187,14 +323,25 @@ ${agentDefinition}
 </agent-definition>
 `;
 
-    return await evaluateBase(systemMessage, evaluationPrompt);
+    const evaluation = await evaluateBase(systemMessage, evaluationPrompt);
+    const warnings = staticIssues.filter((issue) => issue.severity === "warning");
+    const penalty = Math.min(4, warnings.length * 2);
+    const score = Math.max(0, Math.min(10, evaluation.score - penalty));
+
+    return {
+        score,
+        reasoning: warnings.length > 0
+            ? `${warnings.map((issue) => issue.message).join(" ")} ${evaluation.reasoning}`
+            : evaluation.reasoning,
+    };
 }
 
 
 export {
     evaluatePerformance,
     evaluateSkillDefinition,
-    evaluateAgentDefinition
+    evaluateAgentDefinition,
+    evaluateStaticAgentIssues
 };
 
 export type { EvaluationResult };
