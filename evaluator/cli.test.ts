@@ -98,17 +98,31 @@ test("explicit --files accepts repo paths without the leading dot on .agents dir
     }
 });
 
-test("explicit --files accepts the repo's real relative paths without hidden-directory prefixes", () => {
-    const result = runCli([
-        "evaluate",
-        "--files",
-        "../.github/agents/csharper.agent.md",
-        "../agents/skills/generic-skill-name",
-        "--json",
-    ]);
+test("explicit --files accepts dotless skill paths and enforces folder names", () => {
+    const fixtureDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-eval-folder-name-"));
+    const skillDirectory = path.join(fixtureDirectory, ".agents", "skills", "actual-skill");
 
-    assert.equal(result.status, 0, result.stderr || result.stdout);
-    assert.match(result.stdout, /\{.*"fileName".*\}/);
+    fs.mkdirSync(skillDirectory, { recursive: true });
+    fs.writeFileSync(path.join(skillDirectory, "SKILL.md"), `---
+name: wrong-skill
+description: Rotate and compress application log files that exceed a size threshold.
+---
+
+# Rotate Logs
+
+Archive log files when they exceed a threshold.
+`);
+
+    try {
+        const dotlessSkill = path.join(fixtureDirectory, "agents", "skills", "actual-skill");
+        const result = runCli(["evaluate", "--files", dotlessSkill, "--json"]);
+
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        assert.match(result.stdout, /"score":0/);
+        assert.match(result.stdout, /folder name 'actual-skill'/);
+    } finally {
+        fs.rmSync(fixtureDirectory, { recursive: true, force: true });
+    }
 });
 
 test("explicit --files rejects invalid entries before evaluation", () => {

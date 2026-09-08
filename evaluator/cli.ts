@@ -8,6 +8,15 @@ import { generateBadgeSvg, type BadgeEntry } from "./badge.js";
 
 const program = new Command();
 
+function getSkillFolderName(skillDirectory: string) {
+    const normalizedDirectory = skillDirectory.replace(/[\\/]+$/, "").replace(/\\/g, "/");
+    return path.posix.basename(normalizedDirectory);
+}
+
+function getEvaluationErrorMessage(error: unknown) {
+    return error instanceof Error ? error.message : String(error);
+}
+
 function normalizeExplicitFiles(files: string[]) {
     return files
         .flatMap((entry) => entry.split(","))
@@ -93,14 +102,22 @@ async function runEvaluationForFiles(agentFiles: string[], skillDirectories: str
         }
         // Get the content of the agent file
         const content = await fs.promises.readFile(agentFile, "utf-8");
-        const evaluation = evaluateAgentDefinition(content);
+        const fileName = path.posix.relative(directory, agentFile);
         evaluationRuns.push(
             (async () => {
-                const e = await evaluation;
-                return {
-                    fileName: path.posix.relative(directory, agentFile),
-                    score: e.score,
-                    reasoning: e.reasoning,
+                try {
+                    const e = await evaluateAgentDefinition(content);
+                    return {
+                        fileName,
+                        score: e.score,
+                        reasoning: e.reasoning,
+                    }
+                } catch (error) {
+                    return {
+                        fileName,
+                        score: 0,
+                        reasoning: `Evaluation failed: ${getEvaluationErrorMessage(error)}`,
+                    };
                 }
             })()
         );
@@ -136,14 +153,23 @@ async function runEvaluationForFiles(agentFiles: string[], skillDirectories: str
             }
         }
 
-        const evaluation = evaluateSkillDefinition(skillContent, skillFileContents);
+        const fileName = path.posix.relative(directory, skillFile);
+        const folderName = getSkillFolderName(skillDirectory);
 
         evaluationRuns.push((async () => {
-            const e = await evaluation;
-            return {
-                fileName: path.posix.relative(directory, skillFile),
-                score: e.score,
-                reasoning: e.reasoning
+            try {
+                const e = await evaluateSkillDefinition(skillContent, skillFileContents, { folderName });
+                return {
+                    fileName,
+                    score: e.score,
+                    reasoning: e.reasoning
+                }
+            } catch (error) {
+                return {
+                    fileName,
+                    score: 0,
+                    reasoning: `Evaluation failed: ${getEvaluationErrorMessage(error)}`,
+                };
             }
         })()
         );
