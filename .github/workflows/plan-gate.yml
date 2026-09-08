@@ -25,7 +25,7 @@ jobs:
               missing=1
             fi
           }
-          check "## Plan (required)"
+          check "## Plan"
           check "**Goal:**"
           check "**Scope (paths/files):**"
           check "**Steps:**"
